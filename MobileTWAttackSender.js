@@ -1,12 +1,15 @@
-// === Ochrana podľa player ID ===
-const ALLOWED_IDS = [829169, 949172]; // sem daj všetky povolené ID
-const playerId = game_data?.player?.id || null;
+(() => {
 
-if (!ALLOWED_IDS.includes(Number(playerId))) {
-    alert('Skript nie je povolený pre tento účet. Kontaktuj ma na discorde: CaptainM4rtin :)');
-    throw new Error('Unauthorized');
-}
-// === koniec ochrany ===
+    // === Ochrana podľa player ID ===
+    const ALLOWED_IDS = [829169]; // sem daj všetky povolené ID
+    const playerId = game_data?.player?.id || null;
+
+    if (!ALLOWED_IDS.includes(Number(playerId))) {
+        alert('Skript nie je povolený pre tento účet. Kontaktuj ma na discorde: CaptainM4rtin :)');
+        throw new Error('Unauthorized');
+    }
+    // === koniec ochrany ===
+
 
     let inputMs;
     let input;
