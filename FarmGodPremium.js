@@ -6,7 +6,7 @@ const ALLOWED_IDS = [111111111, 222222222]; // sem daj všetky povolené ID
 const playerId = game_data?.player?.id || null;
 
 if (!ALLOWED_IDS.includes(Number(playerId))) {
-    alert('Skript nie je povolený pre tento účet.');
+    alert('Skript nie je povolený pre tento účet. Kontaktuj ma na discorde: CaptainM4rtin :)');
     throw new Error('Unauthorized');
 }
 // === koniec ochrany ===
