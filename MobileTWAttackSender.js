@@ -1,7 +1,7 @@
 (() => {
 
     // === Ochrana podľa player ID ===
-    const ALLOWED_IDS = [829169]; // sem daj všetky povolené ID
+    const ALLOWED_IDS = [829169, 949172]; // sem daj všetky povolené ID
     const playerId = game_data?.player?.id || null;
 
     if (!ALLOWED_IDS.includes(Number(playerId))) {
