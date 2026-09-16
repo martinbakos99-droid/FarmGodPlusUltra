@@ -2,7 +2,7 @@
 // + blacklist + limit bodov
 
 // === Ochrana podľa player ID ===
-const ALLOWED_IDS = [829169, 222222222]; // sem daj všetky povolené ID
+const ALLOWED_IDS = [829169, 949172]; // sem daj všetky povolené ID
 const playerId = game_data?.player?.id || null;
 
 if (!ALLOWED_IDS.includes(Number(playerId))) {
