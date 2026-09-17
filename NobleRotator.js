@@ -3,20 +3,32 @@
 
 /*
 =====================================================================
-👑 NOBLE ROTATION v1.5.1
+👑 NOBLE ROTATION v1.5.2
 =====================================================================
 
+v1.5.2:
+- FIX: neznáma oddanosť (?) NIE JE prevzatá dedina.
+- null / undefined / "" sa nikdy nesmie zmeniť cez Number() na 0.
+- PREVZATÁ iba pri SKUTOČNE známej loyalty <= 0.
+- SMART môže normálne začať útok na cieľ bez predchádzajúceho reportu.
+- Po prvom dopade čaká na nový noble report.
+- Opravuje starý chybný conquered stav pri ?.
+
 v1.5.1:
-- SMART MODE z v1.5.0
-- Ak pri START nie je doma noble/ram alebo escort jednotky,
-  skript zostane BEŽAŤ.
-- Dostupnosť kontroluje každých 10–20 sekúnd.
-- Keď sa jednotka vráti, automaticky začne distribúciu.
-- Ochrana proti paralelnému initialDistribution().
+- Ak pri START nie je doma noble/ram alebo escort,
+  skript zostáva BEŽAŤ.
+- Kontrola každých 10–20 sekúnd.
+
+SMART:
+- Max útokov / cieľ = bezpečnostné maximum.
+- Na jeden cieľ neposiela ďalší noble naslepo.
+- Po dopade načíta NOVÝ report.
+- Loyalty > 0 = pokračuje.
+- Loyalty <= 0 = PREVZATÁ.
 =====================================================================
 */
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 
 const CONFIG = {
     UNIT_INFO_URL: '/interface.php?func=get_unit_info',
@@ -53,23 +65,17 @@ let busy = false;
 let schedulerTimer = null;
 let uiTimer = null;
 
-/*
-v1.5.1:
-Kontrola prvotnej distribúcie.
-
-Ak pri štarte nie je noble doma,
-toto zabráni paralelnému spusteniu
-viacerých initialDistribution().
-*/
 let waitingInitialDistribution = false;
 let initialRetryAt = null;
 
 let state = loadState() || createDefaultState();
 let uiState = loadUIState();
 
-if (typeof state.settings.smartMode !== 'boolean') {
-    state.settings.smartMode = false;
-}
+/*
+=====================================================================
+BASIC STATE
+=====================================================================
+*/
 
 function createDefaultState() {
     return {
@@ -113,6 +119,105 @@ function createDefaultUIState() {
     };
 }
 
+/*
+=====================================================================
+v1.5.2 - STRICT LOYALTY HELPERS
+=====================================================================
+
+Toto je dôležitá oprava.
+
+Number(null) === 0
+
+Preto NIKDY nesmieme iba spraviť:
+
+Number(target.loyalty) <= 0
+
+bez toho, aby sme najskôr overili,
+že loyalty skutočne existuje.
+=====================================================================
+*/
+
+function hasRealLoyalty(target) {
+    if (!target) {
+        return false;
+    }
+
+    if (
+        target.loyaltyKnown !== true
+    ) {
+        return false;
+    }
+
+    if (
+        target.loyalty === null ||
+        target.loyalty === undefined ||
+        target.loyalty === ''
+    ) {
+        return false;
+    }
+
+    return Number.isFinite(
+        Number(target.loyalty)
+    );
+}
+
+function isTargetReallyConquered(target) {
+    return (
+        hasRealLoyalty(target) &&
+        Number(target.loyalty) <= 0
+    );
+}
+
+function normalizeTargetConqueredState(target) {
+    if (!target) {
+        return;
+    }
+
+    /*
+    ? = NEZNÁMA oddanosť.
+
+    Taká dedina NESMIE byť conquered.
+    */
+    if (!hasRealLoyalty(target)) {
+        target.conquered = false;
+
+        /*
+        Oprava starého v1.5.1 stavu:
+        ak bol cieľ omylom finished kvôli
+        null -> 0, odblokujeme ho.
+
+        Samozrejme iba pokiaľ ešte nevyčerpal
+        maximum útokov.
+        */
+        if (
+            Number(target.sent || 0) <
+            Number(target.wanted || 0)
+        ) {
+            target.finished = false;
+        }
+
+        return;
+    }
+
+    if (
+        Number(target.loyalty) <= 0
+    ) {
+        target.conquered = true;
+        target.finished = true;
+        target.waitingForLoyalty = false;
+
+        return;
+    }
+
+    target.conquered = false;
+}
+
+/*
+=====================================================================
+STORAGE
+=====================================================================
+*/
+
 function saveState() {
     try {
         state.version = VERSION;
@@ -150,6 +255,14 @@ function loadState() {
         loaded.settings =
             loaded.settings || {};
 
+        if (
+            typeof loaded.settings.smartMode !==
+            'boolean'
+        ) {
+            loaded.settings.smartMode =
+                false;
+        }
+
         loaded.targets =
             Array.isArray(loaded.targets)
                 ? loaded.targets
@@ -157,54 +270,150 @@ function loadState() {
 
         loaded.targets =
             loaded.targets.map(
-                target => ({
-                    ...target,
+                target => {
+                    /*
+                    Dôležité:
+                    loyalty najskôr overujeme
+                    BEZ Number(null).
+                    */
+                    const rawLoyalty =
+                        target.loyalty;
 
-                    loyalty:
+                    const loyaltyExists =
+                        rawLoyalty !== null &&
+                        rawLoyalty !== undefined &&
+                        rawLoyalty !== '' &&
                         Number.isFinite(
-                            Number(target.loyalty)
-                        )
-                            ? Number(target.loyalty)
-                            : null,
+                            Number(rawLoyalty)
+                        );
 
-                    loyaltyKnown:
-                        Boolean(target.loyaltyKnown) &&
-                        Number.isFinite(
-                            Number(target.loyalty)
-                        ),
+                    const loyaltyKnown =
+                        target.loyaltyKnown === true &&
+                        loyaltyExists;
 
-                    loyaltyReportTime:
-                        Number.isFinite(
-                            Number(
-                                target.loyaltyReportTime
-                            )
-                        )
-                            ? Number(
-                                target.loyaltyReportTime
-                            )
-                            : null,
+                    const normalized = {
+                        ...target,
 
-                    loyaltyReportId:
-                        target.loyaltyReportId ||
-                        null,
-
-                    loyaltyReportUrl:
-                        target.loyaltyReportUrl ||
-                        null,
-
-                    loyaltyLoading: false,
-
-                    loyaltyError: null,
-
-                    conquered:
-                        Boolean(target.conquered) ||
-                        (
+                        sent:
                             Number.isFinite(
-                                Number(target.loyalty)
-                            ) &&
-                            Number(target.loyalty) <= 0
-                        )
-                })
+                                Number(target.sent)
+                            )
+                                ? Number(target.sent)
+                                : 0,
+
+                        wanted:
+                            Number.isFinite(
+                                Number(target.wanted)
+                            )
+                                ? Number(target.wanted)
+                                : Number(
+                                    loaded.settings
+                                        .attacksPerTarget ||
+                                    CONFIG
+                                        .DEFAULT_ATTACKS_PER_TARGET
+                                ),
+
+                        loyalty:
+                            loyaltyKnown
+                                ? Number(rawLoyalty)
+                                : null,
+
+                        loyaltyKnown,
+
+                        loyaltyReportTime:
+                            loyaltyKnown &&
+                            target.loyaltyReportTime !== null &&
+                            target.loyaltyReportTime !== undefined &&
+                            Number.isFinite(
+                                Number(
+                                    target.loyaltyReportTime
+                                )
+                            )
+                                ? Number(
+                                    target.loyaltyReportTime
+                                )
+                                : null,
+
+                        loyaltyReportId:
+                            loyaltyKnown
+                                ? (
+                                    target.loyaltyReportId ||
+                                    null
+                                )
+                                : null,
+
+                        loyaltyReportUrl:
+                            loyaltyKnown
+                                ? (
+                                    target.loyaltyReportUrl ||
+                                    null
+                                )
+                                : null,
+
+                        loyaltyLoading: false,
+
+                        loyaltyError:
+                            target.loyaltyError ||
+                            null,
+
+                        waitingForLoyalty:
+                            Boolean(
+                                target.waitingForLoyalty
+                            ),
+
+                        finished:
+                            Boolean(
+                                target.finished
+                            ),
+
+                        conquered: false
+                    };
+
+                    /*
+                    STRICT:
+                    conquered iba pri reálnej
+                    loyalty <= 0.
+                    */
+                    if (
+                        loyaltyKnown &&
+                        Number(
+                            normalized.loyalty
+                        ) <= 0
+                    ) {
+                        normalized.conquered =
+                            true;
+
+                        normalized.finished =
+                            true;
+
+                        normalized.waitingForLoyalty =
+                            false;
+
+                    } else {
+                        normalized.conquered =
+                            false;
+
+                        /*
+                        Automatická oprava bugu
+                        z predchádzajúcej verzie.
+
+                        Ak je loyalty ?, ale target
+                        bol uložený ako finished,
+                        znovu ho aktivujeme, pokiaľ
+                        ešte má útoky k dispozícii.
+                        */
+                        if (
+                            !loyaltyKnown &&
+                            normalized.sent <
+                            normalized.wanted
+                        ) {
+                            normalized.finished =
+                                false;
+                        }
+                    }
+
+                    return normalized;
+                }
             );
 
         loaded.slots =
@@ -282,6 +491,12 @@ function loadUIState() {
         return createDefaultUIState();
     }
 }
+
+/*
+=====================================================================
+GENERAL HELPERS
+=====================================================================
+*/
 
 function sleep(ms) {
     return new Promise(
@@ -420,6 +635,7 @@ function parseCoords(text) {
     return {
         x: Number(match[1]),
         y: Number(match[2]),
+
         coords:
             `${match[1]}|${match[2]}`
     };
@@ -449,7 +665,9 @@ function log(
 
     state.log.unshift(item);
 
-    if (state.log.length > 200) {
+    if (
+        state.log.length > 200
+    ) {
         state.log.length = 200;
     }
 
@@ -615,12 +833,14 @@ function getEstimatedLoyalty(
     target,
     now = Date.now()
 ) {
+    /*
+    v1.5.2:
+    žiadny Number(null).
+    */
     if (
-        !target ||
-        !target.loyaltyKnown ||
-        !Number.isFinite(
-            Number(target.loyalty)
-        ) ||
+        !hasRealLoyalty(target) ||
+        target.loyaltyReportTime === null ||
+        target.loyaltyReportTime === undefined ||
         !Number.isFinite(
             Number(
                 target.loyaltyReportTime
@@ -630,19 +850,15 @@ function getEstimatedLoyalty(
         return null;
     }
 
-    /*
-    Ak report hovorí 0 alebo mínus,
-    dedina už bola prevzatá.
+    const base =
+        Number(target.loyalty);
 
-    Na takú hodnotu už regeneráciu
-    nepridávame.
+    /*
+    0 alebo mínus = prevzatá.
+    Už neregenerujeme.
     */
-    if (
-        Number(target.loyalty) <= 0
-    ) {
-        return Number(
-            target.loyalty
-        );
+    if (base <= 0) {
+        return base;
     }
 
     const elapsedHours =
@@ -660,7 +876,7 @@ function getEstimatedLoyalty(
     return Math.min(
         100,
 
-        Number(target.loyalty) +
+        base +
         elapsedHours *
         CONFIG.LOYALTY_REGEN_PER_HOUR
     );
@@ -905,9 +1121,7 @@ function parseReportTime(
         : null;
 }
 
-function getReportTargetCoords(
-    row
-) {
+function getReportTargetCoords(row) {
     const subject =
         row.querySelector(
             '.report-subject'
@@ -946,9 +1160,7 @@ function isNobleReportRow(row) {
     );
 }
 
-function getReportTimeFromRow(
-    row
-) {
+function getReportTimeFromRow(row) {
     const cells = [
         ...row.querySelectorAll(
             'td.nowrap'
@@ -971,7 +1183,7 @@ function getReportTimeFromRow(
         }
     }
 
-    const cellsAll = [
+    const allCells = [
         ...row.querySelectorAll(
             'td'
         )
@@ -979,13 +1191,13 @@ function getReportTimeFromRow(
 
     for (
         let i =
-            cellsAll.length - 1;
+            allCells.length - 1;
         i >= 0;
         i--
     ) {
         const timestamp =
             parseReportTime(
-                cellsAll[i].textContent
+                allCells[i].textContent
             );
 
         if (timestamp) {
@@ -1011,7 +1223,10 @@ function extractReportCandidates(
         )
     ];
 
-    for (const link of links) {
+    for (
+        const link
+        of links
+    ) {
         const row =
             link.closest('tr');
 
@@ -1080,16 +1295,17 @@ function extractReportCandidates(
     return result;
 }
 
-function parseLoyaltyFromReport(
-    doc
-) {
+function parseLoyaltyFromReport(doc) {
     const rows = [
         ...doc.querySelectorAll(
             'tr'
         )
     ];
 
-    for (const row of rows) {
+    for (
+        const row
+        of rows
+    ) {
         const header =
             row.querySelector(
                 'th'
@@ -1128,22 +1344,47 @@ function parseLoyaltyFromReport(
             )
         ]
             .map(
-                node =>
-                    Number(
+                node => {
+                    const raw =
                         String(
                             node.textContent ||
                             ''
-                        ).replace(
-                            /[^0-9.-]/g,
-                            ''
                         )
+                            .replace(
+                                ',',
+                                '.'
+                            )
+                            .replace(
+                                /[^0-9.-]/g,
+                                ''
+                            );
+
+                    if (
+                        raw === '' ||
+                        raw === '-' ||
+                        raw === '.'
+                    ) {
+                        return null;
+                    }
+
+                    const number =
+                        Number(raw);
+
+                    return Number.isFinite(
+                        number
                     )
+                        ? number
+                        : null;
+                }
             )
             .filter(
-                Number.isFinite
+                value =>
+                    value !== null
             );
 
-        if (boldValues.length) {
+        if (
+            boldValues.length
+        ) {
             return boldValues[
                 boldValues.length - 1
             ];
@@ -1166,24 +1407,33 @@ function parseLoyaltyFromReport(
             numbers &&
             numbers.length
         ) {
-            const value =
-                Number(
-                    numbers[
-                        numbers.length - 1
-                    ].replace(
-                        ',',
-                        '.'
-                    )
+            const raw =
+                numbers[
+                    numbers.length - 1
+                ].replace(
+                    ',',
+                    '.'
                 );
 
-            return Number.isFinite(
-                value
-            )
-                ? value
-                : null;
+            const value =
+                Number(raw);
+
+            if (
+                Number.isFinite(
+                    value
+                )
+            ) {
+                return value;
+            }
         }
     }
 
+    /*
+    null znamená:
+    hodnota nebola zistená.
+
+    NIKDY to neznamená 0.
+    */
     return null;
 }
 
@@ -1354,9 +1604,15 @@ async function applyLoyaltyReport(
             doc
         );
 
+    /*
+    STRICT v1.5.2:
+    null NIE JE 0.
+    */
     if (
+        loyalty === null ||
+        loyalty === undefined ||
         !Number.isFinite(
-            loyalty
+            Number(loyalty)
         )
     ) {
         throw new Error(
@@ -1369,13 +1625,7 @@ async function applyLoyaltyReport(
         Date.now();
 
     target.loyalty =
-        Math.min(
-            100,
-            Number(loyalty)
-        );
-
-    target.conquered =
-        Number(loyalty) <= 0;
+        Number(loyalty);
 
     target.loyaltyKnown =
         true;
@@ -1392,6 +1642,21 @@ async function applyLoyaltyReport(
 
     target.loyaltyError =
         null;
+
+    /*
+    PREVZATÁ iba pri skutočnej
+    hodnote <= 0.
+    */
+    target.conquered =
+        Number(loyalty) <= 0;
+
+    if (target.conquered) {
+        target.finished =
+            true;
+
+        target.waitingForLoyalty =
+            false;
+    }
 
     return true;
 }
@@ -1413,7 +1678,9 @@ async function refreshLoyalties(
                 )
         );
 
-    if (!wantedTargets.length) {
+    if (
+        !wantedTargets.length
+    ) {
         return;
     }
 
@@ -1456,6 +1723,19 @@ async function refreshLoyalties(
                     target.coords
                 );
 
+            /*
+            =========================================================
+            ŽIADNY REPORT
+            =========================================================
+
+            Toto je hlavná oprava v1.5.2.
+
+            Žiadny report = ?
+            NIE = 0
+            NIE = conquered
+            NIE = finished
+            =========================================================
+            */
             if (!candidate) {
                 target.loyaltyKnown =
                     false;
@@ -1477,6 +1757,21 @@ async function refreshLoyalties(
 
                 target.loyaltyLoading =
                     false;
+
+                target.conquered =
+                    false;
+
+                if (
+                    Number(
+                        target.sent || 0
+                    ) <
+                    Number(
+                        target.wanted || 0
+                    )
+                ) {
+                    target.finished =
+                        false;
+                }
 
                 continue;
             }
@@ -1508,10 +1803,24 @@ async function refreshLoyalties(
                 }
 
             } catch (e) {
+                /*
+                Ak report existuje, ale
+                loyalty sa nedá prečítať,
+                stále to NESMIE znamenať 0.
+                */
                 target.loyaltyKnown =
                     false;
 
                 target.loyalty =
+                    null;
+
+                target.loyaltyReportTime =
+                    null;
+
+                target.loyaltyReportId =
+                    null;
+
+                target.loyaltyReportUrl =
                     null;
 
                 target.loyaltyError =
@@ -1520,10 +1829,26 @@ async function refreshLoyalties(
                 target.loyaltyLoading =
                     false;
 
+                target.conquered =
+                    false;
+
+                if (
+                    Number(
+                        target.sent || 0
+                    ) <
+                    Number(
+                        target.wanted || 0
+                    )
+                ) {
+                    target.finished =
+                        false;
+                }
+
                 if (!silent) {
                     log(
                         `${target.coords}: ` +
-                        `loyalty — ${e.message}`,
+                        `loyalty neznáma — ` +
+                        `${e.message}`,
                         'warning'
                     );
                 }
@@ -1553,6 +1878,18 @@ async function refreshLoyalties(
 
             target.loyaltyError =
                 e.message;
+
+            /*
+            Ani globálna chyba reportov
+            nesmie označiť dedinu
+            za prevzatú.
+            */
+            if (
+                !hasRealLoyalty(target)
+            ) {
+                target.conquered =
+                    false;
+            }
         }
 
         log(
@@ -2209,8 +2546,7 @@ async function createConfirmation(
     if (!hToken) {
         console.log(
             '[Noble Rotation] ' +
-            'Confirmation nemá ' +
-            'samostatný H token.'
+            'Confirmation nemá samostatný H token.'
         );
     }
 
@@ -2363,6 +2699,12 @@ async function submitConfirmation(
     };
 }
 
+/*
+=====================================================================
+SEND ONE
+=====================================================================
+*/
+
 async function sendOne(
     targetCoords
 ) {
@@ -2494,9 +2836,77 @@ function getTarget(coords) {
     );
 }
 
+/*
+=====================================================================
+v1.5.2 - TARGET NEEDS ATTACK
+=====================================================================
+
+Najdôležitejšia oprava:
+
+? = neznáma oddanosť.
+
+Taký cieľ je normálne aktívny
+a SMART naň môže poslať prvého noble.
+=====================================================================
+*/
+
 function targetNeedsAttack(target) {
     if (!target) {
         return false;
+    }
+
+    /*
+    Najskôr opravíme conquered stav
+    podľa skutočnej loyalty.
+    */
+    normalizeTargetConqueredState(
+        target
+    );
+
+    /*
+    Iba reálna loyalty <= 0
+    znamená PREVZATÁ.
+    */
+    if (
+        isTargetReallyConquered(
+            target
+        )
+    ) {
+        target.conquered =
+            true;
+
+        target.finished =
+            true;
+
+        target.waitingForLoyalty =
+            false;
+
+        return false;
+    }
+
+    /*
+    Ak loyalty nepoznáme,
+    cieľ NESMIE byť conquered.
+    */
+    if (
+        !hasRealLoyalty(
+            target
+        )
+    ) {
+        target.conquered =
+            false;
+
+        if (
+            Number(
+                target.sent || 0
+            ) <
+            Number(
+                target.wanted || 0
+            )
+        ) {
+            target.finished =
+                false;
+        }
     }
 
     if (
@@ -2506,6 +2916,10 @@ function targetNeedsAttack(target) {
         return false;
     }
 
+    /*
+    SMART už jeden noble poslal
+    a čaká na report.
+    */
     if (
         state.settings.smartMode &&
         target.waitingForLoyalty
@@ -2590,13 +3004,27 @@ function createSlot(
                 !state.settings.ramTest
             ),
 
+        /*
+        Ak je loyalty ?, reportBeforeId
+        bude jednoducho null.
+
+        To je úplne validný SMART stav.
+        */
         reportBeforeId:
-            target?.loyaltyReportId ||
-            null,
+            hasRealLoyalty(target)
+                ? (
+                    target.loyaltyReportId ||
+                    null
+                )
+                : null,
 
         reportBeforeTime:
-            target?.loyaltyReportTime ||
-            null,
+            hasRealLoyalty(target)
+                ? (
+                    target.loyaltyReportTime ||
+                    null
+                )
+                : null,
 
         reportChecked:
             false,
@@ -2632,8 +3060,9 @@ function isNewReportForSlot(
     }
 
     /*
-    Máme starý report ID.
-    Nový útok musí priniesť iné ID.
+    -------------------------------------------------------------
+    MALI SME STARÝ REPORT
+    -------------------------------------------------------------
     */
     if (
         candidate.reportId &&
@@ -2641,10 +3070,6 @@ function isNewReportForSlot(
         String(candidate.reportId) !==
         String(slot.reportBeforeId)
     ) {
-        /*
-        Ochrana proti nájdeniu
-        nejakého staršieho reportu.
-        */
         if (
             candidate.reportTime &&
             candidate.reportTime <
@@ -2657,8 +3082,17 @@ function isNewReportForSlot(
     }
 
     /*
-    Pred útokom sme nemali žiadny
-    report na daný cieľ.
+    -------------------------------------------------------------
+    PRED ÚTOKOM NEBOL ŽIADNY REPORT
+    -------------------------------------------------------------
+
+    Presne prípad:
+        Oddanosť ?
+        Noble report nenájdený
+
+    Prvý report vytvorený po útoku
+    je nový SMART report.
+    -------------------------------------------------------------
     */
     if (
         !slot.reportBeforeId &&
@@ -2671,7 +3105,8 @@ function isNewReportForSlot(
     }
 
     /*
-    Fallback cez čas reportu.
+    Ak nemáme report ID, ale máme
+    starý report time, použijeme čas.
     */
     if (
         candidate.reportTime &&
@@ -2719,6 +3154,45 @@ function markTargetConquered(
     target,
     loyalty
 ) {
+    /*
+    STRICT ochrana.
+
+    Túto funkciu nesmieme použiť
+    pre null / ? / undefined.
+    */
+    if (
+        loyalty === null ||
+        loyalty === undefined ||
+        loyalty === '' ||
+        !Number.isFinite(
+            Number(loyalty)
+        )
+    ) {
+        log(
+            `${target.coords}: ` +
+            `SMART nemá platnú loyalty. ` +
+            `Cieľ NEBUDE označený ako prevzatý.`,
+            'warning'
+        );
+
+        target.conquered =
+            false;
+
+        saveState();
+        renderTargets();
+
+        return false;
+    }
+
+    if (
+        Number(loyalty) > 0
+    ) {
+        target.conquered =
+            false;
+
+        return false;
+    }
+
     target.conquered =
         true;
 
@@ -2739,7 +3213,7 @@ function markTargetConquered(
 
     /*
     Všetky sloty pre túto dedinu
-    už ukončíme.
+    môžeme ukončiť.
     */
     for (
         const slot
@@ -2767,6 +3241,8 @@ function markTargetConquered(
         `Ďalší noble sa neposiela.`,
         'success'
     );
+
+    return true;
 }
 
 async function processSmartReport(
@@ -2793,16 +3269,44 @@ async function processSmartReport(
         return false;
     }
 
+    /*
+    v1.5.2:
+    conquered overujeme striktne.
+    */
+    normalizeTargetConqueredState(
+        target
+    );
+
     if (
-        target.conquered ||
-        target.finished
+        isTargetReallyConquered(
+            target
+        )
     ) {
+        target.conquered =
+            true;
+
+        target.finished =
+            true;
+
         slot.finished =
             true;
 
         saveState();
+        renderTargets();
 
         return true;
+    }
+
+    /*
+    Ak je loyalty ?, normálne pokračujeme.
+    */
+    if (
+        !hasRealLoyalty(
+            target
+        )
+    ) {
+        target.conquered =
+            false;
     }
 
     /*
@@ -2844,11 +3348,19 @@ async function processSmartReport(
         return false;
     }
 
+    /*
+    Report ešte nevznikol.
+
+    DÔLEŽITÉ:
+    nič nemeníme na conquered.
+    Len čakáme.
+    */
     if (!candidate) {
-        /*
-        Report ešte nie je dostupný.
-        Scheduler ho skontroluje znova.
-        */
+        target.conquered =
+            false;
+
+        saveState();
+
         return false;
     }
 
@@ -2867,20 +3379,24 @@ async function processSmartReport(
         target.waitingForLoyalty =
             false;
 
-        const loyalty =
-            Number(
-                target.loyalty
-            );
-
+        /*
+        Po applyLoyaltyReport musí byť
+        loyalty skutočne známa.
+        */
         if (
-            !Number.isFinite(
-                loyalty
+            !hasRealLoyalty(
+                target
             )
         ) {
             throw new Error(
                 'SMART report nemá platnú oddanosť.'
             );
         }
+
+        const loyalty =
+            Number(
+                target.loyalty
+            );
 
         log(
             `${target.coords}: ` +
@@ -2904,6 +3420,13 @@ async function processSmartReport(
 
             return true;
         }
+
+        /*
+        Loyalty > 0.
+        Určite NIE JE prevzatá.
+        */
+        target.conquered =
+            false;
 
         /*
         -------------------------------------------------------------
@@ -2938,11 +3461,10 @@ async function processSmartReport(
         }
 
         /*
-        Loyalty je stále > 0.
+        Loyalty > 0 a máme ešte útoky.
 
         Slot ostáva aktívny.
-        Keď sa noble vráti,
-        pošleme ho znova.
+        Po návrate noble pošleme ďalšieho.
         */
         saveState();
         renderTargets();
@@ -2958,6 +3480,19 @@ async function processSmartReport(
 
         slot.waitingForReport =
             false;
+
+        /*
+        Chyba pri reportoch NIKDY
+        nesmie znamenať conquered.
+        */
+        if (
+            !hasRealLoyalty(
+                target
+            )
+        ) {
+            target.conquered =
+                false;
+        }
 
         saveState();
         renderTargets();
@@ -3026,16 +3561,7 @@ async function processSmartImpacts() {
 
 /*
 =====================================================================
-v1.5.1 - INITIAL AVAILABILITY
-=====================================================================
-
-Toto je nová časť.
-
-Ak pri štarte nie je doma noble/ram
-alebo escort, neukončíme celý script.
-
-Namiesto toho nastavíme initialRetryAt
-a scheduler skúsi dostupnosť znova.
+INITIAL AVAILABILITY RETRY
 =====================================================================
 */
 
@@ -3076,6 +3602,12 @@ function clearInitialRetry() {
     updateLiveUI();
 }
 
+/*
+=====================================================================
+INITIAL DISTRIBUTION
+=====================================================================
+*/
+
 async function initialDistribution() {
     if (!running) {
         return {
@@ -3097,9 +3629,8 @@ async function initialDistribution() {
         );
 
     /*
-    -------------------------------------------------------------
-    NOBLE / RAM NIE JE DOMA
-    -------------------------------------------------------------
+    NOBLE / RAM NIE JE DOMA.
+    Script zostáva BEŽAŤ.
     */
     if (
         unitBudget < 1
@@ -3124,11 +3655,6 @@ async function initialDistribution() {
             state.settings.light
         );
 
-    /*
-    -------------------------------------------------------------
-    AXE NIE SÚ DOMA
-    -------------------------------------------------------------
-    */
     if (
         axePerAttack > 0 &&
         Number(available.axe) <
@@ -3145,11 +3671,6 @@ async function initialDistribution() {
         };
     }
 
-    /*
-    -------------------------------------------------------------
-    LIGHT NIE SÚ DOMA
-    -------------------------------------------------------------
-    */
     if (
         lightPerAttack > 0 &&
         Number(available.light) <
@@ -3166,10 +3687,6 @@ async function initialDistribution() {
         };
     }
 
-    /*
-    Jednotky sú doma.
-    Retry stav môžeme zrušiť.
-    */
     clearInitialRetry();
 
     let escortBudget =
@@ -3183,8 +3700,7 @@ async function initialDistribution() {
                 escortBudget,
                 Math.floor(
                     Number(
-                        available.axe ||
-                        0
+                        available.axe || 0
                     ) /
                     axePerAttack
                 )
@@ -3199,8 +3715,7 @@ async function initialDistribution() {
                 escortBudget,
                 Math.floor(
                     Number(
-                        available.light ||
-                        0
+                        available.light || 0
                     ) /
                     lightPerAttack
                 )
@@ -3222,11 +3737,6 @@ async function initialDistribution() {
             escortBudget
         );
 
-    /*
-    Teoreticky by sa sem už nemalo dostať
-    s nulovým budgetom, ale nechávame
-    bezpečnostnú kontrolu.
-    */
     if (
         attackBudget <= 0
     ) {
@@ -3256,6 +3766,10 @@ async function initialDistribution() {
         const candidates =
             state.targets.filter(
                 target => {
+                    /*
+                    Toto už správne vráti TRUE
+                    aj pri loyalty ?.
+                    */
                     if (
                         !targetNeedsAttack(
                             target
@@ -3274,9 +3788,9 @@ async function initialDistribution() {
                     }
 
                     /*
-                    SMART pošle počas jednej
-                    distribúcie maximálne
-                    jeden noble na jeden cieľ.
+                    SMART:
+                    počas tejto distribúcie
+                    maximálne jeden noble/cieľ.
                     */
                     if (
                         state.settings.smartMode &&
@@ -3289,8 +3803,9 @@ async function initialDistribution() {
                     }
 
                     /*
-                    Ak už cieľ má aktívny SMART slot,
-                    ďalší noble tam teraz neposielame.
+                    Ak už existuje aktívny
+                    SMART slot pre cieľ,
+                    ďalší noble tam neposielame.
                     */
                     if (
                         state.settings.smartMode &&
@@ -3340,12 +3855,6 @@ async function initialDistribution() {
                     target.coords
                 );
 
-            /*
-            Jednotka medzitým mohla odísť
-            alebo sa stav rally pointu zmenil.
-            Preto unavailable neberieme
-            ako fatálnu chybu.
-            */
             if (
                 !result.success &&
                 result.unavailable
@@ -3402,6 +3911,11 @@ async function initialDistribution() {
                 target.lastError =
                     null;
 
+                /*
+                Dôležité:
+                aj cieľ s ? dostane normálne
+                svoj prvý SMART slot.
+                */
                 createSlot(
                     target.coords,
                     result.travel
@@ -3421,14 +3935,33 @@ async function initialDistribution() {
                     target.waitingForLoyalty =
                         false;
 
-                    log(
-                        `${target.coords}: ` +
-                        `🧠 SMART noble ` +
-                        `${target.sent}/${target.wanted} ` +
-                        `odoslaný. ` +
-                        `Po dopade počkám na nový report.`,
-                        'success'
-                    );
+                    if (
+                        hasRealLoyalty(
+                            target
+                        )
+                    ) {
+                        log(
+                            `${target.coords}: ` +
+                            `🧠 SMART noble ` +
+                            `${target.sent}/${target.wanted} ` +
+                            `odoslaný. ` +
+                            `Aktuálna oddanosť ~` +
+                            `${getDisplayedLoyalty(target)}. ` +
+                            `Po dopade čakám na nový report.`,
+                            'success'
+                        );
+
+                    } else {
+                        log(
+                            `${target.coords}: ` +
+                            `🧠 SMART noble ` +
+                            `${target.sent}/${target.wanted} ` +
+                            `odoslaný. ` +
+                            `Oddanosť zatiaľ neznáma (?). ` +
+                            `Prvý nový report ju zistí.`,
+                            'success'
+                        );
+                    }
 
                 } else {
                     log(
@@ -3526,20 +4059,6 @@ async function initialDistribution() {
         }
     }
 
-    /*
-    Ak sme poslali všetko, čo bolo
-    momentálne doma, ale existujú ďalšie
-    ciele bez aktívneho slotu, v1.5.1
-    môže čakať na ďalší noble.
-
-    Toto je dôležité napríklad:
-    - 3 ciele
-    - doma iba 1 noble
-    - SMART
-
-    Noble odíde na prvý cieľ.
-    Scheduler zostáva aktívny.
-    */
     const remainingWithoutSlot =
         state.targets.some(
             target =>
@@ -3577,7 +4096,7 @@ async function initialDistribution() {
 
 /*
 =====================================================================
-v1.5.1 - RETRY INITIAL DISTRIBUTION
+RETRY INITIAL DISTRIBUTION
 =====================================================================
 */
 
@@ -3597,10 +4116,6 @@ async function processInitialRetry() {
         return;
     }
 
-    /*
-    Zablokujeme ďalší retry, kým
-    aktuálna kontrola prebieha.
-    */
     waitingInitialDistribution =
         false;
 
@@ -3658,10 +4173,24 @@ async function processReturnedSlot(
         return;
     }
 
+    /*
+    Strict kontrola conquered.
+    */
+    normalizeTargetConqueredState(
+        target
+    );
+
     if (
-        target.conquered ||
-        target.finished
+        isTargetReallyConquered(
+            target
+        )
     ) {
+        target.conquered =
+            true;
+
+        target.finished =
+            true;
+
         slot.finished =
             true;
 
@@ -3669,6 +4198,18 @@ async function processReturnedSlot(
         renderTargets();
 
         return;
+    }
+
+    /*
+    ? NIE JE dôvod ukončiť slot.
+    */
+    if (
+        !hasRealLoyalty(
+            target
+        )
+    ) {
+        target.conquered =
+            false;
     }
 
     /*
@@ -3686,9 +4227,16 @@ async function processReturnedSlot(
             );
 
         if (
-            target.conquered ||
-            target.finished
+            isTargetReallyConquered(
+                target
+            )
         ) {
+            target.conquered =
+                true;
+
+            target.finished =
+                true;
+
             slot.finished =
                 true;
 
@@ -3731,6 +4279,10 @@ async function processReturnedSlot(
         Number(target.sent) >=
         Number(target.wanted)
     ) {
+        /*
+        Ak sme SMART a report už ukázal
+        > 0, maximum bolo dosiahnuté.
+        */
         slot.finished =
             true;
 
@@ -3859,17 +4411,27 @@ async function processReturnedSlot(
         }
 
         /*
-        Pred ďalším SMART noble
-        uložíme posledný report.
+        Pred ďalším SMART útokom
+        uložíme posledný SKUTOČNÝ report.
+
+        Pri ? ostáva null.
         */
         if (slot.smart) {
             slot.reportBeforeId =
-                target.loyaltyReportId ||
-                null;
+                hasRealLoyalty(target)
+                    ? (
+                        target.loyaltyReportId ||
+                        null
+                    )
+                    : null;
 
             slot.reportBeforeTime =
-                target.loyaltyReportTime ||
-                null;
+                hasRealLoyalty(target)
+                    ? (
+                        target.loyaltyReportTime ||
+                        null
+                    )
+                    : null;
         }
 
         log(
@@ -3885,10 +4447,6 @@ async function processReturnedSlot(
             );
 
         if (!result.success) {
-            /*
-            Aj tu nechceme skončiť,
-            ak jednotka medzitým zmizla.
-            */
             if (
                 result.unavailable
             ) {
@@ -4019,8 +4577,13 @@ async function processReturnedSlot(
         }
 
         /*
-        SMART posledný povolený útok
-        nesmie skončiť pred reportom.
+        SMART pri poslednom povolenom útoku
+        ešte NESMIE slot ukončiť.
+
+        Najskôr musí prísť report a až potom
+        sa rozhodne:
+        <=0 PREVZATÁ
+        >0 LIMIT
         */
         if (
             Number(target.sent) >=
@@ -4082,7 +4645,7 @@ async function processReturnedSlot(
 
 /*
 =====================================================================
-SCHEDULER v1.5.1
+SCHEDULER
 =====================================================================
 */
 
@@ -4098,19 +4661,18 @@ async function scheduler() {
 
     try {
         /*
-        1. SMART reporty po dopade.
+        1. SMART report po dopade.
         */
         await processSmartImpacts();
 
         /*
-        2. Novinka v1.5.1:
-        ak pri štarte nebol noble doma,
-        skontrolujeme ho po retry intervale.
+        2. Ak nebol noble doma,
+        skontrolujeme dostupnosť.
         */
         await processInitialRetry();
 
         /*
-        3. Návraty existujúcich slotov.
+        3. Spracovanie vrátených slotov.
         */
         const now =
             Date.now();
@@ -4167,7 +4729,7 @@ async function scheduler() {
 
 /*
 =====================================================================
-START v1.5.1
+START
 =====================================================================
 */
 
@@ -4193,6 +4755,22 @@ async function start() {
         }
 
         /*
+        Pred štartom opravíme staré
+        conquered flagy.
+        */
+        for (
+            const target
+            of state.targets
+        ) {
+            normalizeTargetConqueredState(
+                target
+            );
+        }
+
+        saveState();
+        renderTargets();
+
+        /*
         Loyalty pred štartom.
         */
         if (
@@ -4214,7 +4792,9 @@ async function start() {
             const known =
                 state.targets.filter(
                     target =>
-                        target.loyaltyKnown
+                        hasRealLoyalty(
+                            target
+                        )
                 ).length;
 
             log(
@@ -4226,18 +4806,24 @@ async function start() {
             );
 
             /*
-            Ak už existujúci report
-            hovorí <= 0, cieľ je hotový.
+            STRICT:
+            iba reálna loyalty <=0
+            je PREVZATÁ.
+
+            ? normálne pokračuje.
             */
             for (
                 const target
                 of state.targets
             ) {
+                normalizeTargetConqueredState(
+                    target
+                );
+
                 if (
-                    target.loyaltyKnown &&
-                    Number(
-                        target.loyalty
-                    ) <= 0
+                    isTargetReallyConquered(
+                        target
+                    )
                 ) {
                     target.conquered =
                         true;
@@ -4247,18 +4833,37 @@ async function start() {
 
                     target.waitingForLoyalty =
                         false;
+
+                } else if (
+                    !hasRealLoyalty(
+                        target
+                    )
+                ) {
+                    target.conquered =
+                        false;
+
+                    if (
+                        Number(
+                            target.sent || 0
+                        ) <
+                        Number(
+                            target.wanted || 0
+                        )
+                    ) {
+                        target.finished =
+                            false;
+                    }
                 }
             }
+
+            saveState();
+            renderTargets();
         }
 
         await loadRotationUnitSpeed();
 
         /*
-        DÔLEŽITÉ:
-        running nastavíme ešte PRED
-        kontrolou dostupných noble.
-
-        Preto 0 noble už nevypne script.
+        running ešte pred dostupnosťou noble.
         */
         running = true;
 
@@ -4285,13 +4890,6 @@ async function start() {
             'success'
         );
 
-        /*
-        Scheduler zapneme HNEĎ.
-
-        Aj keby initialDistribution()
-        zistila 0 noble, scheduler už
-        zostane bežať.
-        */
         if (schedulerTimer) {
             clearInterval(
                 schedulerTimer
@@ -4309,15 +4907,6 @@ async function start() {
         const result =
             await initialDistribution();
 
-        /*
-        DRY RUN je jednorazový test.
-
-        Ak boli jednotky dostupné a test
-        prebehol, ukončíme ho ako doteraz.
-
-        Ak dostupné NIE SÚ, zostane bežať
-        a retry ich bude hľadať.
-        */
         if (
             state.settings.dryRun &&
             result &&
@@ -4476,6 +5065,11 @@ function addTargetsFromUI() {
             lastError:
                 null,
 
+            /*
+            Nový cieľ začína ako ?.
+
+            To NIE JE 0.
+            */
             loyalty:
                 null,
 
@@ -4681,10 +5275,6 @@ function readSettingsFromUI() {
     state.settings.smartMode =
         smartMode;
 
-    /*
-    Pri cieľoch, ktoré ešte nezačali,
-    aktualizujeme maximum.
-    */
     for (
         const target
         of state.targets
@@ -4704,6 +5294,14 @@ function readSettingsFromUI() {
                 state.settings
                     .attacksPerTarget;
         }
+
+        /*
+        Po každej zmene nastavení
+        znovu striktne normalizujeme.
+        */
+        normalizeTargetConqueredState(
+            target
+        );
     }
 
     saveState();
@@ -5818,7 +6416,7 @@ Noble Rotation v${VERSION}
 
 /*
 =====================================================================
-ČASŤ 3/3 POKRAČUJE TU
+ČASŤ 3/3 POKRAČUJE PRESNE TU
 =====================================================================
 */
 
@@ -5958,6 +6556,7 @@ function renderTargets() {
                     <th></th>
                 </tr>
             </thead>
+
             <tbody>
     `;
 
@@ -5965,6 +6564,15 @@ function renderTargets() {
         const target
         of state.targets
     ) {
+        /*
+        v1.5.2:
+        pred renderom opravíme prípadný
+        starý chybný conquered flag.
+        */
+        normalizeTargetConqueredState(
+            target
+        );
+
         const slots =
             state.slots.filter(
                 slot =>
@@ -5989,9 +6597,9 @@ function renderTargets() {
         }
 
         /*
-        Ak nemáme žiadny slot, ale čakáme
-        na prvú dostupnú šľachtu, zobrazíme
-        aj initialRetry countdown.
+        Ak čakáme na noble doma
+        a cieľ zatiaľ nemá slot,
+        ukážeme initial retry.
         */
         if (
             !next &&
@@ -6024,18 +6632,35 @@ function renderTargets() {
         let statusClass =
             'nr-status-wait';
 
+        /*
+        =============================================================
+        STRICT STATUS
+        =============================================================
+
+        PREVZATÁ iba:
+        loyaltyKnown === true
+        + skutočná číselná loyalty
+        + loyalty <= 0
+
+        ? nikdy nebude PREVZATÁ.
+        =============================================================
+        */
+
         if (
-            target.conquered
+            isTargetReallyConquered(
+                target
+            )
         ) {
             status =
-                '✅ PREVZATÁ';
+                '☑ PREVZATÁ';
 
             statusClass =
                 'nr-status-conquered';
 
         } else if (
             target.waitingForLoyalty &&
-            state.settings.smartMode
+            state.settings.smartMode &&
+            !state.settings.ramTest
         ) {
             status =
                 '🧠 ČAKÁ NA REPORT';
@@ -6139,7 +6764,7 @@ function renderTargets() {
                     </button>
 
                     ${
-                        target.loyaltyKnown &&
+                        hasRealLoyalty(target) &&
                         target.loyaltyReportTime
                             ? `
                                 <div class="nr-loyalty-sub">
@@ -6171,7 +6796,11 @@ function renderTargets() {
                                             }
                                         </div>
                                     `
-                                    : ''
+                                    : `
+                                        <div class="nr-loyalty-sub">
+                                            Oddanosť neznáma
+                                        </div>
+                                    `
                             )
                     }
 
@@ -6333,7 +6962,7 @@ function renderLog() {
 
 /*
 =====================================================================
-LIVE VALUES
+LIVE LOYALTY
 =====================================================================
 */
 
@@ -6351,6 +6980,23 @@ function updateLoyaltyElements() {
                     );
 
                 if (!target) {
+                    return;
+                }
+
+                /*
+                Ak loyalty nie je skutočne
+                známa, vždy zobrazíme ?.
+                */
+                if (
+                    !hasRealLoyalty(
+                        target
+                    )
+                ) {
+                    element.textContent =
+                        target.loyaltyLoading
+                            ? '…'
+                            : '?';
+
                     return;
                 }
 
@@ -6375,6 +7021,12 @@ function updateLoyaltyElements() {
             }
         );
 }
+
+/*
+=====================================================================
+COUNTDOWN
+=====================================================================
+*/
 
 function updateCountdownElements() {
     document
@@ -6463,6 +7115,12 @@ function getNextGlobalActionTime() {
         null
     );
 }
+
+/*
+=====================================================================
+LIVE UI
+=====================================================================
+*/
 
 function updateLiveUI() {
     updateCountdownElements();
@@ -6629,6 +7287,22 @@ if (
         false;
 }
 
+/*
+=====================================================================
+TARGET MIGRATION / BUG FIX
+=====================================================================
+
+v1.5.1 mohla uložiť napríklad:
+
+loyaltyKnown = false
+loyalty = null
+conquered = true
+finished = true
+
+v1.5.2 to pri načítaní automaticky opraví.
+=====================================================================
+*/
+
 for (
     const target
     of state.targets
@@ -6640,7 +7314,8 @@ for (
             )
         )
     ) {
-        target.sent = 0;
+        target.sent =
+            0;
     }
 
     if (
@@ -6672,22 +7347,80 @@ for (
             false;
     }
 
+    /*
+    loyaltyKnown musí znamenať,
+    že skutočne existuje číslo.
+    */
+    const loyaltyActuallyExists =
+        target.loyalty !== null &&
+        target.loyalty !== undefined &&
+        target.loyalty !== '' &&
+        Number.isFinite(
+            Number(
+                target.loyalty
+            )
+        );
+
     if (
-        typeof target.conquered !==
-        'boolean'
+        target.loyaltyKnown !== true ||
+        !loyaltyActuallyExists
     ) {
+        target.loyaltyKnown =
+            false;
+
+        target.loyalty =
+            null;
+
+        target.loyaltyReportTime =
+            null;
+
+        target.loyaltyReportId =
+            null;
+
+        target.loyaltyReportUrl =
+            null;
+
+        /*
+        HLAVNÁ OPRAVA:
+        ? = NIE JE PREVZATÁ.
+        */
         target.conquered =
-            Boolean(
-                target.loyaltyKnown &&
-                Number.isFinite(
-                    Number(
-                        target.loyalty
-                    )
-                ) &&
-                Number(
-                    target.loyalty
-                ) <= 0
+            false;
+
+        if (
+            Number(
+                target.sent || 0
+            ) <
+            Number(
+                target.wanted || 0
+            )
+        ) {
+            target.finished =
+                false;
+        }
+
+    } else {
+        target.loyalty =
+            Number(
+                target.loyalty
             );
+
+        if (
+            target.loyalty <= 0
+        ) {
+            target.conquered =
+                true;
+
+            target.finished =
+                true;
+
+            target.waitingForLoyalty =
+                false;
+
+        } else {
+            target.conquered =
+                false;
+        }
     }
 
     target.loyaltyLoading =
@@ -6700,14 +7433,18 @@ for (
         target.loyaltyError =
             null;
     }
+
+    normalizeTargetConqueredState(
+        target
+    );
 }
 
 /*
-Staršie sloty z v1.4/v1.5
-môžu byť stále uložené.
-
-Doplníme chýbajúce vlastnosti.
+=====================================================================
+SLOT MIGRATION
+=====================================================================
 */
+
 for (
     const slot
     of state.slots
@@ -6754,8 +7491,6 @@ for (
 
     /*
     Starší slot nemusí mať impactAt.
-    Vieme ho dopočítať zo sentAt
-    a travelSeconds.
     */
     if (
         !Number.isFinite(
@@ -6786,11 +7521,10 @@ for (
 }
 
 /*
-Initial retry je runtime stav.
-
-Po novom vložení skriptu ho
-neobnovujeme zo starého localStorage.
+Runtime retry po novom vložení
+skriptu začína čistý.
 */
+
 waitingInitialDistribution =
     false;
 
@@ -6852,11 +7586,31 @@ window.NobleRotation = {
             }
 
             return {
+                known:
+                    hasRealLoyalty(
+                        target
+                    ),
+
                 base:
-                    target.loyalty,
+                    hasRealLoyalty(
+                        target
+                    )
+                        ? target.loyalty
+                        : null,
 
                 reportTime:
-                    target.loyaltyReportTime,
+                    hasRealLoyalty(
+                        target
+                    )
+                        ? target.loyaltyReportTime
+                        : null,
+
+                reportId:
+                    hasRealLoyalty(
+                        target
+                    )
+                        ? target.loyaltyReportId
+                        : null,
 
                 exact:
                     getEstimatedLoyalty(
@@ -6869,7 +7623,9 @@ window.NobleRotation = {
                     ),
 
                 conquered:
-                    target.conquered
+                    isTargetReallyConquered(
+                        target
+                    )
             };
         },
 
@@ -6945,29 +7701,177 @@ console.log(
     state.slots.length
 );
 
+/*
+=====================================================================
+v1.5.2 LOGIC SUMMARY
+=====================================================================
+
+UNKNOWN TARGET:
+
+    loyaltyKnown = false
+    loyalty = null
+    UI = ?
+
+    => conquered = false
+    => finished = false
+    => SMART môže poslať prvého noble
+
+
+KNOWN TARGET:
+
+    loyalty = 80
+    => pokračuje
+
+    loyalty = 4
+    => pokračuje
+
+    loyalty = 1
+    => pokračuje
+
+    loyalty = 0
+    => PREVZATÁ
+
+    loyalty = -4
+    => PREVZATÁ
+
+    loyalty = -20
+    => PREVZATÁ
+
+
+SMART FLOW:
+
+    ?
+      ↓
+    pošle 1 noble
+      ↓
+    dopad
+      ↓
+    čaká na NOVÝ report
+      ↓
+    napr. 74
+      ↓
+    čaká na návrat noble
+      ↓
+    pošle ďalšieho
+      ↓
+    nový report
+      ↓
+    napr. 47
+      ↓
+    ďalší noble
+      ↓
+    napr. 19
+      ↓
+    ďalší noble
+      ↓
+    napr. -7
+      ↓
+    ☑ PREVZATÁ
+      ↓
+    STOP pre tento cieľ
+
+
+Ak noble nie je doma:
+
+    SPUSTIŤ
+      ↓
+    script zostane BEŽÍ
+      ↓
+    kontrola 10–20 sekúnd
+      ↓
+    stále 0 noble
+      ↓
+    ďalších 10–20 sekúnd
+      ↓
+    noble doma
+      ↓
+    automaticky odošle
+
+
+Max útokov / cieľ:
+
+    V SMART režime ide o bezpečnostný limit.
+
+    Napríklad MAX = 5:
+
+    Ak dedinu prevezme tretí noble:
+        ďalší sa neposiela.
+
+    Ak po piatom noble zostane loyalty > 0:
+        ďalší sa neposiela,
+        pretože bol dosiahnutý limit.
+
+=====================================================================
+*/
+
 console.log(
-    '[Noble Rotation] v1.5.1 ready.'
+    '[Noble Rotation] v1.5.2 ready.'
 );
 
 /*
 =====================================================================
-v1.5.1 SUMMARY
+FINAL SAFETY CHECK
+=====================================================================
 
-1. Klikneš SPUSTIŤ.
-2. Ak noble nie je doma:
-      BEŽÍ
-      ⏳ ČAKÁM NA NOBLE
-3. Kontrola každých náhodných 10–20 sekúnd.
-4. Noble sa objaví doma → automatické odoslanie.
-5. SMART po dopade načíta NOVÝ report.
-6. Loyalty > 0 → po návrate noble pokračuje.
-7. Loyalty <= 0 → ✅ PREVZATÁ.
-8. Max útokov/cieľ je iba bezpečnostný limit SMART režimu.
+Ešte raz odstránime akýkoľvek starý
+falošný conquered stav pri neznámej loyalty.
+
+Toto je úmyselne redundantné.
 =====================================================================
 */
 
-// =================================================================
-// END
-// =================================================================
+let repairedUnknownTargets =
+    0;
+
+for (
+    const target
+    of state.targets
+) {
+    if (
+        !hasRealLoyalty(
+            target
+        ) &&
+        target.conquered
+    ) {
+        target.conquered =
+            false;
+
+        if (
+            Number(
+                target.sent || 0
+            ) <
+            Number(
+                target.wanted || 0
+            )
+        ) {
+            target.finished =
+                false;
+        }
+
+        repairedUnknownTargets++;
+    }
+}
+
+if (
+    repairedUnknownTargets > 0
+) {
+    saveState();
+    renderTargets();
+
+    log(
+        `v1.5.2 opravila ` +
+        `${repairedUnknownTargets} ` +
+        `cieľov, ktoré mali neznámu ` +
+        `oddanosť (?) a boli nesprávne ` +
+        `označené ako prevzaté.`,
+        'success'
+    );
+}
+
+/*
+=====================================================================
+END
+=====================================================================
+*/
 
 })();
